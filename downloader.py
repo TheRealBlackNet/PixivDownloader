@@ -18,17 +18,26 @@ Ablauf:
   3. Aus ..._p0.jpg werden ..._p1.jpg ... ..._p(N-1).jpg erzeugt und heruntergeladen
      (mit Referer, Fortsetzen per Range, Wiederholung mit Wartezeit, Limit parallel).
   4. Links, Status und Einstellungen werden in ./data gespeichert und beim Start geladen.
+  5. Animierte Werke (Ugoira, im Browser ein <canvas>): Der Netzwerkverkehr der Seite wird
+     mitgelesen (ugoira_meta + ZIP mit Einzelbildern). Die ZIP wird geladen und mit ffmpeg
+     (muss im PATH liegen oder in settings.json unter "ffmpeg_path" stehen) zu MP4/WebM mit
+     den Original-Bildzeiten zusammengesetzt.
 """
 import atexit
 import json
+import math
 import os
 import queue
 import re
+import shutil
 import sqlite3
+import subprocess
 import sys
 import threading
 import time
 import webbrowser
+import zipfile
+from functools import reduce
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.error import HTTPError, URLError
@@ -63,10 +72,16 @@ DEFAULTS = {
     "xpath_link_alt": "/html/body/div[1]/div/div[2]/div[5]/div[1]/div/div[1]/main/section/div[1]/div/figure/div[1]/div[1]/div/a",
     # Letzter Fallback (CSS): darf nur einmal vorkommen (oder genau einmal das Bild <img> enthalten)
     "css_link_fallback": "[href*=\"_p0.\"]",
+    # Animierte Werke (Ugoira): Canvas als Ausloeser, Quelle ist die ZIP aus dem Netzwerkverkehr
+    "css_canvas": "canvas",
+    "ugoira_original": True,             # True = Original-ZIP bevorzugen (sonst 600x600); bei Fehler automatisch 600x600
+    "ugoira_format": "mp4",              # "mp4" (H.264) oder "webm" (VP9)
+    "ffmpeg_path": "",                   # leer = PATH bzw. Umgebungsvariable "ffmpeg" verwenden
 }
 
 STOP = threading.Event()
 PROGRESS = {}                            # image_id -> (bytes_done, bytes_total)
+PHASE = {}                               # image_id -> Text, z. B. 'wandelt um (ffmpeg)'
 UI = {"message": "", "login_open": False}
 SETTINGS = None
 db = None
@@ -170,7 +185,8 @@ CREATE TABLE IF NOT EXISTS pages(
 CREATE TABLE IF NOT EXISTS images(
     id INTEGER PRIMARY KEY, page_id INTEGER, url TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
     status TEXT NOT NULL DEFAULT 'wartend', bytes INTEGER NOT NULL DEFAULT 0, size INTEGER NOT NULL DEFAULT 0,
-    retries INTEGER NOT NULL DEFAULT 0, not_before REAL NOT NULL DEFAULT 0, error TEXT, path TEXT, added REAL);
+    retries INTEGER NOT NULL DEFAULT 0, not_before REAL NOT NULL DEFAULT 0, error TEXT, path TEXT, added REAL,
+    kind TEXT NOT NULL DEFAULT 'bild', meta TEXT);
 """
 
 
@@ -181,6 +197,12 @@ class DB:
         self.lock = threading.RLock()
         with self.lock:
             self.conn.executescript(SCHEMA)
+            # Aeltere Datenbanken ohne Ugoira-Spalten erweitern
+            cols = {r["name"] for r in self.conn.execute("PRAGMA table_info(images)")}
+            if "kind" not in cols:
+                self.conn.execute("ALTER TABLE images ADD COLUMN kind TEXT NOT NULL DEFAULT 'bild'")
+            if "meta" not in cols:
+                self.conn.execute("ALTER TABLE images ADD COLUMN meta TEXT")
             # Beim Start: unterbrochene Arbeiten wieder in die Warteschlange (.part-Dateien werden fortgesetzt)
             self.conn.execute("UPDATE pages SET status='wartend' WHERE status='aufloesen'")
             self.conn.execute("UPDATE images SET status='wartend', not_before=0 WHERE status='laedt'")
@@ -197,6 +219,10 @@ class DB:
             self.conn.commit()
             return cur.rowcount
 
+    def insert_ugoira(self, page_id, url, name, meta):
+        return self.x("INSERT OR IGNORE INTO images(page_id,url,name,status,kind,meta,added) "
+                      "VALUES(?,?,?,'wartend','ugoira',?,?)", (page_id, url, name, meta, time.time()))
+
     def insert_image(self, page_id, url):
         return self.x("INSERT OR IGNORE INTO images(page_id,url,name,status,added) VALUES(?,?,?,'wartend',?)",
                       (page_id, url, file_name_from_url(url), time.time()))
@@ -207,7 +233,8 @@ class DB:
 # ----------------------------------------------------------------------------
 # Reihenfolge: 1. XPath, 2. Alternativ-XPath, 3. Fallback document.querySelector('[href*="_p0."]')
 # (Fallback nur, wenn es genau EIN Element gibt; bei mehreren zaehlt nur das, das ein <img> enthaelt).
-FIND_LINK_JS = """([xp1, xp2, css]) => {
+# 4. Gibt es keinen Bild-Link, aber ein <canvas>, wird die Seite als animiertes Werk (Ugoira) behandelt.
+FIND_LINK_JS = """([xp1, xp2, css, cv]) => {
   const byX = x => { try { return document.evaluate(x, document, null, XPathResult.FIRST_ORDERED_NODE_TYPE, null).singleNodeValue; } catch (e) { return null; } };
   const names = ["xpath", "xpath_alt"];
   const xs = [xp1, xp2];
@@ -223,13 +250,15 @@ FIND_LINK_JS = """([xp1, xp2, css]) => {
     const href = list[0].getAttribute("href");
     if (href) return {href: href, source: "fallback"};
   }
+  try { if (cv && document.querySelector(cv)) return {canvas: true}; } catch (e) {}
   return null;
 }"""
 
-DIAGNOSE_JS = """([xp1, xp2, css]) => {
+DIAGNOSE_JS = """([xp1, xp2, css, cv]) => {
   const n = x => { try { return document.evaluate(x, document, null, XPathResult.ORDERED_NODE_SNAPSHOT_TYPE, null).snapshotLength; } catch (e) { return -1; } };
   let c = -1; try { c = document.querySelectorAll(css).length; } catch (e) {}
-  return {x1: n(xp1), x2: n(xp2), css: c, title: document.title};
+  let k = -1; try { k = document.querySelectorAll(cv).length; } catch (e) {}
+  return {x1: n(xp1), x2: n(xp2), css: c, cv: k, title: document.title};
 }"""
 
 
@@ -300,6 +329,56 @@ class Resolver(threading.Thread):
                 except Exception:
                     pass
 
+    # --- Animiertes Werk (Ugoira) -----------------------------------------
+    def resolve_ugoira(self, page, row, captured):
+        pid, url = row["id"], row["url"]
+        for _ in range(40):                          # bis zu 10 s auf Meta-Antwort bzw. ZIP-Adresse warten
+            if captured["meta"] is not None or captured["zip"]:
+                break
+            page.wait_for_timeout(250)
+
+        def usable(b):
+            return isinstance(b, dict) and isinstance(b.get("frames"), list) and b["frames"]
+
+        body = None
+        if captured["meta"] is not None:
+            try:
+                body = (captured["meta"].json() or {}).get("body")
+            except Exception:
+                body = None
+        if not usable(body):                         # Fallback: dieselbe Abfrage mit den Cookies des Browsers
+            m = re.search(r"/artworks/(\d+)", url) or re.search(r"/(\d+)_ugoira", captured["zip"] or "")
+            if m:
+                o = urlparse(url)
+                api = f"{o.scheme}://{o.netloc}/ajax/illust/{m.group(1)}/ugoira_meta?lang=en"
+                try:
+                    r = self.ctx.request.get(api, headers={"Referer": url})
+                    if r.ok:
+                        body = (r.json() or {}).get("body")
+                except Exception:
+                    body = None
+        if not usable(body):
+            raise LinkNotFound("Canvas gefunden, aber keine Ugoira-Bildzeiten (ugoira_meta) erhalten - "
+                               f"Meta im Netzwerkverkehr: {'ja' if captured['meta'] else 'nein'}, "
+                               f"ZIP-Adresse: {'ja' if captured['zip'] else 'nein'}. Ohne Bildzeiten ist "
+                               "kein korrektes Video moeglich.")
+
+        frames = [{"file": f.get("file"), "delay": int(f.get("delay") or 0)}
+                  for f in body["frames"] if isinstance(f, dict) and f.get("file")]
+        src = body.get("src") or captured["zip"]
+        orig = body.get("originalSrc")
+        use_orig = bool(SETTINGS.get("ugoira_original")) and bool(orig)
+        main = orig if use_orig else src
+        if not main:
+            raise LinkNotFound("Canvas gefunden, aber keine ZIP-Adresse in ugoira_meta")
+        fallback = src if (use_orig and src and src != orig) else None
+        ext = "webm" if SETTINGS.get("ugoira_format") == "webm" else "mp4"
+        m = re.search(r"/(\d+)_ugoira", main) or re.search(r"/artworks/(\d+)", url)
+        name = f"{m.group(1) if m else file_name_from_url(url)}_ugoira.{ext}"
+        db.insert_ugoira(pid, main, name, json.dumps({"frames": frames, "fallback_url": fallback}))
+        db.x("UPDATE pages SET status='fertig', total=1, error=? WHERE id=?",
+             (f"Ugoira: {len(frames)} Frames ({'Original' if use_orig else '600x600'}) -> {ext}", pid))
+
     # --- Seite aufloesen ---------------------------------------------------
     def resolve_page(self, row):
         pid, url = row["id"], row["url"]
@@ -312,10 +391,26 @@ class Resolver(threading.Thread):
             if self.ctx is None:
                 self.ctx = self.open_ctx(bool(SETTINGS.get("headless")))
             page = self.ctx.new_page()
+
+            # Netzwerkverkehr mitlesen (fuer animierte Werke): ugoira_meta-Antwort und ZIP-Adresse
+            captured = {"meta": None, "zip": None}
+
+            def on_response(resp):
+                try:
+                    u = resp.url
+                except Exception:
+                    return
+                if "ugoira_meta" in u and captured["meta"] is None:
+                    captured["meta"] = resp
+                elif "img-zip-ugoira" in u and ".zip" in u.split("?")[0] and captured["zip"] is None:
+                    captured["zip"] = u
+
+            page.on("response", on_response)
             page.goto(url, wait_until="domcontentloaded", timeout=45000)
 
             count_sel = "xpath=" + SETTINGS.get("xpath_count")
-            args = [SETTINGS.get("xpath_link"), SETTINGS.get("xpath_link_alt"), SETTINGS.get("css_link_fallback")]
+            args = [SETTINGS.get("xpath_link"), SETTINGS.get("xpath_link_alt"), SETTINGS.get("css_link_fallback"),
+                    SETTINGS.get("css_canvas")]
             try:
                 found = page.wait_for_function(FIND_LINK_JS, arg=args, timeout=25000, polling=250).json_value()
             except self.PWTimeout:
@@ -323,13 +418,21 @@ class Resolver(threading.Thread):
                     d = page.evaluate(DIAGNOSE_JS, args)
                     raise LinkNotFound(
                         f"Bild-Link nicht gefunden - XPath 1: {d['x1']} Treffer, XPath 2: {d['x2']} Treffer, "
-                        f"Fallback: {d['css']} Treffer (Seitentitel: {d['title']}). "
+                        f"Fallback: {d['css']} Treffer, Canvas: {d['cv']} Treffer (Seitentitel: {d['title']}). "
                         "Nicht angemeldet, Seite geloescht oder Layout geaendert?")
                 except LinkNotFound:
                     raise
                 except Exception:
                     raise LinkNotFound("Bild-Link nicht gefunden (nicht angemeldet, Seite geloescht "
                                        "oder Layout geaendert?)")
+            if found.get("canvas"):
+                page.wait_for_timeout(1500)         # Gnadenfrist: kommt doch noch ein normaler Bild-Link?
+                again = page.evaluate(FIND_LINK_JS, args)
+                if again and again.get("href"):
+                    found = again
+            if found.get("canvas"):
+                self.resolve_ugoira(page, row, captured)
+                return
             href = urljoin(url, found["href"])
             source = found["source"]
 
@@ -484,11 +587,126 @@ def mark_done(iid, url, name, final, size):
              (size, size, str(final), iid))
 
 
+def find_ffmpeg():
+    """ffmpeg suchen: Einstellung ffmpeg_path, dann PATH, dann Umgebungsvariable 'ffmpeg' (Datei oder Ordner)."""
+    cands = []
+    p = str(SETTINGS.get("ffmpeg_path") or "").strip()
+    if p:
+        cands.append(p)
+    w = shutil.which("ffmpeg")
+    if w:
+        cands.append(w)
+    env = os.environ.get("ffmpeg") or os.environ.get("FFMPEG")
+    if env:
+        cands.append(env)
+    for c in cands:
+        pc = Path(os.path.expandvars(c.strip().strip('"')))
+        for o in ([pc] if pc.is_file() else [pc / "ffmpeg.exe", pc / "bin" / "ffmpeg.exe", pc / "ffmpeg", pc / "bin" / "ffmpeg"]):
+            if o.is_file():
+                return str(o)
+    return None
+
+
+def run_ffmpeg(cmd, cwd):
+    kw = {"creationflags": subprocess.CREATE_NO_WINDOW} if os.name == "nt" else {}
+    proc = subprocess.Popen(cmd, cwd=str(cwd), stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                            stderr=subprocess.PIPE, **kw)
+    deadline = time.time() + 1800
+    while proc.poll() is None:
+        if STOP.is_set():
+            proc.kill()
+            raise Aborted()
+        if time.time() > deadline:
+            proc.kill()
+            raise IOError("ffmpeg: Zeitueberschreitung")
+        time.sleep(0.2)
+    err = proc.stderr.read().decode("utf-8", "replace").strip()
+    if proc.returncode != 0:
+        raise PermanentError("ffmpeg-Fehler: " + (err.splitlines()[-1] if err else f"Exit-Code {proc.returncode}"))
+
+
+def run_ugoira(row, dest_dir):
+    """ZIP mit Einzelbildern laden und mit ffmpeg unter Beachtung der Bildzeiten zu MP4/WebM machen."""
+    iid, name = row["id"], row["name"]
+    meta = json.loads(row["meta"] or "{}")
+    frames = meta.get("frames") or []
+    if not frames:
+        raise PermanentError("Ugoira ohne Bildzeiten")
+    final = dest_dir / name
+    if final.exists() and final.stat().st_size > 0:
+        mark_done(iid, row["url"], name, final, final.stat().st_size)
+        return
+    ffmpeg = find_ffmpeg()
+    if not ffmpeg:
+        raise PermanentError("ffmpeg nicht gefunden (in PATH aufnehmen oder in data/settings.json bei "
+                             "\"ffmpeg_path\" eintragen)")
+
+    work = dest_dir / f".ugoira_{iid}"
+    work.mkdir(parents=True, exist_ok=True)
+    zip_path, part = work / "ugoira.zip", work / "ugoira.zip.part"
+    if not zip_path.exists():
+        urls = [row["url"]] + ([meta["fallback_url"]] if meta.get("fallback_url") else [])
+        for i, u in enumerate(urls):
+            try:
+                fetch(u, part, iid)
+                os.replace(part, zip_path)
+                break
+            except HTTPError as e:
+                if e.code in (401, 403, 404, 410) and i + 1 < len(urls):
+                    part.unlink(missing_ok=True)       # Original nicht erreichbar -> 600x600 versuchen
+                    continue
+                if e.code in (401, 403, 404, 410):
+                    raise PermanentError(f"HTTP {e.code} beim Laden der Ugoira-ZIP (Referer/Anmeldung pruefen)")
+                raise
+
+    PHASE[iid] = "wandelt um (ffmpeg)"
+    frames_dir = work / "frames"
+    shutil.rmtree(frames_dir, ignore_errors=True)
+    frames_dir.mkdir()
+    try:
+        with zipfile.ZipFile(zip_path) as z:
+            z.extractall(frames_dir)
+            names = sorted(n for n in z.namelist() if not n.endswith("/"))
+    except zipfile.BadZipFile:
+        zip_path.unlink(missing_ok=True)
+        raise IOError("Ugoira-ZIP beschaedigt - wird neu geladen")
+
+    files = [f["file"] for f in frames]
+    if not all((frames_dir / f).is_file() for f in files):
+        if len(names) != len(frames):
+            raise PermanentError("Dateien in der ZIP passen nicht zur Bildliste")
+        files = names                                   # gleiche Anzahl: nach Dateiname sortiert zuordnen
+    delays = [max(1, int(f["delay"])) for f in frames]
+
+    lines = []
+    for f, d in zip(files, delays):
+        lines += [f"file 'frames/{f}'", f"duration {d / 1000:.3f}"]
+    lines.append(f"file 'frames/{files[-1]}'")         # concat-Eigenheit: letztes Bild nochmal, sonst zaehlt seine Dauer nicht
+    (work / "list.txt").write_text("\n".join(lines) + "\n", "utf-8")
+
+    g = reduce(math.gcd, delays)
+    fps = f"1000/{g}" if g >= 10 else "100"             # konstante Bildrate passend zu den Bildzeiten (max. 100)
+    ext = final.suffix.lower().lstrip(".")
+    codec = (["-c:v", "libvpx-vp9", "-crf", "30", "-b:v", "0", "-pix_fmt", "yuv420p"] if ext == "webm" else
+             ["-c:v", "libx264", "-preset", "medium", "-crf", "18", "-pix_fmt", "yuv420p", "-movflags", "+faststart"])
+    out = f"out.{ext}"
+    total_s = f"{sum(delays) / 1000:.3f}"                # exakt die Summe der Bildzeiten (kein Extra-Bild am Ende der Schleife)
+    run_ffmpeg([ffmpeg, "-y", "-nostdin", "-loglevel", "error", "-f", "concat", "-i", "list.txt",
+                "-vf", f"scale=trunc(iw/2)*2:trunc(ih/2)*2,fps={fps}", "-t", total_s, *codec, out], work)
+    os.replace(work / out, final)
+    size = final.stat().st_size
+    shutil.rmtree(work, ignore_errors=True)
+    mark_done(iid, row["url"], name, final, size)
+
+
 def run_job(row):
     iid, retries = row["id"], row["retries"]
     try:
         dest_dir = Path(SETTINGS.get("download_dir"))
         dest_dir.mkdir(parents=True, exist_ok=True)
+        if row["kind"] == "ugoira":
+            run_ugoira(row, dest_dir)
+            return
         for cand in candidate_urls(row["url"]):
             name = file_name_from_url(cand)
             final = dest_dir / name
@@ -512,11 +730,14 @@ def run_job(row):
         db.x("UPDATE images SET status='wartend', not_before=0 WHERE id=?", (iid,))
     except PermanentError as e:
         db.x("UPDATE images SET status='fehler', error=? WHERE id=?", (str(e), iid))
+        if row["kind"] == "ugoira":
+            shutil.rmtree(Path(SETTINGS.get("download_dir")) / f".ugoira_{iid}", ignore_errors=True)
     except Exception as e:                                         # noqa: BLE001
         schedule_retry(iid, retries, describe(e),
                        min_delay=60 if isinstance(e, HTTPError) and e.code == 429 else 0)
     finally:
         PROGRESS.pop(iid, None)
+        PHASE.pop(iid, None)
 
 
 class Downloader(threading.Thread):
@@ -594,6 +815,8 @@ def build_state():
     images = []
     for r in rows:
         d = dict(r)
+        d.pop("meta", None)
+        d["phase"] = PHASE.get(r["id"], "")
         prog = PROGRESS.get(r["id"])
         if r["status"] == "laedt" and prog:
             d["bytes"], d["size"] = prog[0], prog[1] or 0
@@ -881,7 +1104,7 @@ function render(s) {
   setHtml("#images", s.images.length ? '<table><tr><th>Datei</th><th>Status</th><th>Fortschritt</th><th>Größe</th><th>Hinweis</th><th></th></tr>' +
     s.images.map(i => {
       const pct = i.size ? Math.min(100, Math.round(i.bytes / i.size * 100)) : (i.status === "fertig" ? 100 : 0);
-      let note = i.error || "";
+      let note = i.phase || i.error || "";
       if (i.status === "wartend" && i.retries) note = "Versuch " + (i.retries + 1) + " in " + i.retry_in + " s – " + note;
       return '<tr><td title="' + esc(i.url) + '">' + esc(i.name) + '</td>' +
         '<td>' + stBadge(i.status) + '</td>' +
